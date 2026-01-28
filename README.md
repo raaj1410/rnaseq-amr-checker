@@ -11,6 +11,23 @@ A local Python tool that checks, for one or more bacterial species:
 This tool is designed to minimise false positives. It may return fewer matches by design.
 
 ---
+**Quick start** if you're in a hurry:
+Windows (PowerShell)
+```powershell
+python -m venv .venv
+Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass
+.\.venv\Scripts\Activate.ps1
+pip install -r requirements.txt
+python rnaseq_amr_checker.py --species "Pseudomonas aeruginosa"
+```
+macOS / Linux
+```bash
+python3 -m venv .venv
+source .venv/bin/activate
+pip install -r requirements.txt
+python rnaseq_amr_checker.py --species "Pseudomonas aeruginosa"
+```
+---
 
 ## What “conservative” means here
 - AMR records are filtered to keep **lab-only** evidence and reject “predicted / in silico / computational” signals.
