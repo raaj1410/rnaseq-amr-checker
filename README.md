@@ -30,8 +30,8 @@ python rnaseq_amr_checker.py --species "Pseudomonas aeruginosa"
 ---
 
 ## What “conservative” means here
-- AMR records are filtered to keep **lab-only** evidence and reject “predicted / in silico / computational” signals.
-- RNA-seq is marked available only when a genome’s **BioSample accession** maps to real RNA-seq run IDs (**SRR/ERR/DRR**) using SRA and/or ENA.
+- AMR records are filtered from BV-BRC to keep **lab-only** evidence and reject “predicted / in silico / computational” signals.
+- RNA-seq is marked available only when a genome’s **BioSample accession** from BV-BRC maps to RNA-seq run IDs (**SRR/ERR/DRR**) from NCBI, EBI, and DDBJ using SRA and/or ENA.
 
 ---
 
