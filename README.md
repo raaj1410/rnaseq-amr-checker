@@ -88,6 +88,37 @@ If **2+ species** succeed:
 - You also get:
   - `rnaseq_true_combined_<timestamp>.csv`
   - `rnaseq_amr_outputs_<timestamp>.zip` (contains all outputs including the combined CSV)
+    
+### Important: Opening CSV in Excel without losing genome_id decimals (e.g., `208964.400`)
+
+Excel often auto-detects numbers and will display `208964.400` as `208964.4` when you open the CSV by double-clicking.  
+That does **not** mean the tool changed the genome_id — it’s Excel formatting.
+
+To keep **genome_id exactly as-is**, import it as **Text**:
+
+### Excel (Windows) – 3-step Import Wizard method
+
+1) **Open Excel** → go to **Data** tab → **From Text/CSV** (or **Get Data → From File → From Text/CSV**)  
+   Select the CSV file.
+
+2) In the wizard **Step 1 of 3**:
+   - Choose **Delimited**
+   - Click **Next**
+
+3) In **Step 2 of 3**:
+   - Tick **Comma**
+   - Click **Next**
+
+4) In **Step 3 of 3**:
+   - Click the `genome_id` column in the preview
+   - Select **Text** under “Column data format”
+   - (Optional but recommended) also set these to **Text** to avoid Excel messing with them:
+     - `biosample_accession`, `bioproject_accession`
+     - `rnaseq_run_ids`, `rnaseq_run_ids_sra`, `rnaseq_run_ids_ena`
+     - `assembly_accession_best`, `genbank_accessions`, `refseq_accessions`
+   - Click **Finish**
+
+This imports `genome_id` as text, so values like `208964.400` stay exactly the same.
 
 ---
 
