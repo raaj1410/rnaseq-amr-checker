@@ -11,11 +11,10 @@
 # - STRONG ONLY: join is ONLY via the SAME BioSample accession (no BioProject fallback)
 # - Accepts SRR/ERR/DRR (not SRR-only)
 #
-# OUTPUT RULE:
+# OUTPUT RULE (UPDATED):
 # - If exactly 1 species succeeds: CSV outputs only (NO ZIP)
-# - If 2+ species succeed: ONE ZIP ONLY in outputs folder.
-#     - ZIP contains: all per-species outputs + combined rnaseq_true CSV
-#     - Per-species CSVs are cleaned up after zipping (not left loose in outputs/)
+# - If 2+ species succeed: create ONE ZIP (including per-species CSVs + debug + taxon summary + combined rnaseq_true),
+#   then DELETE the individual CSV files from the outputs folder (zip-only for multi-species runs).
 # =========================
 
 import os
@@ -81,7 +80,7 @@ BS_TOKEN_RE = re.compile(r"(?:SAMN|SAMEA|SAMD)\d+", re.IGNORECASE)
 ASM_RE = re.compile(r"(?:GCA|GCF)_\d+\.\d+", re.IGNORECASE)
 
 sess = requests.Session()
-sess.headers.update({"User-Agent": "rnaseq_amr_checker_local/6.4"})
+sess.headers.update({"User-Agent": "rnaseq_amr_checker_local/6.5"})
 _last_call = 0.0
 
 
@@ -100,7 +99,7 @@ def rql_val(s: str) -> str:
     return quote(str(s), safe="")
 
 
-def _params(extra: dict):
+def _params(extra: dict) -> dict:
     p = dict(extra)
     p["tool"] = "rnaseq_amr_checker"
     if NCBI_EMAIL:
@@ -113,6 +112,7 @@ def _params(extra: dict):
 def eutils_get(endpoint: str, params: dict, timeout: int = 60, max_retries: int = 8) -> requests.Response:
     global _last_call
     url = EUTILS + endpoint
+    last_r = None
     for attempt in range(max_retries):
         now = time.monotonic()
         wait = (_last_call + MIN_INTERVAL) - now
@@ -120,6 +120,7 @@ def eutils_get(endpoint: str, params: dict, timeout: int = 60, max_retries: int 
             time.sleep(wait)
 
         r = sess.get(url, params=_params(params), timeout=timeout)
+        last_r = r
         _last_call = time.monotonic()
 
         if r.status_code == 429 or (500 <= r.status_code < 600):
@@ -134,8 +135,10 @@ def eutils_get(endpoint: str, params: dict, timeout: int = 60, max_retries: int 
         r.raise_for_status()
         return r
 
-    r.raise_for_status()
-    return r
+    if last_r is not None:
+        last_r.raise_for_status()
+        return last_r
+    raise RuntimeError("NCBI eutils request failed with no response")
 
 
 def http_get_retry(url: str, timeout: int = 120, max_retries: int = 10, backoff_base: float = 1.6) -> requests.Response:
@@ -212,6 +215,7 @@ def bvbrc_fetch_all(
 
     df = pd.DataFrame(out)
 
+    # Ensure all expected columns exist
     for col in select_fields:
         if col not in df.columns:
             df[col] = pd.Series(dtype="object")
@@ -402,7 +406,8 @@ def run_map_biosample_only_sra_ena(
         )
 
     # --- ENA ---
-    ena_fields = ["run_accession", "sample_accession", "secondary_sample_accession", "library_strategy", "fastq_ftp", "fastq_md5"]
+    ena_fields = ["run_accession", "sample_accession", "secondary_sample_accession",
+                  "library_strategy", "fastq_ftp", "fastq_md5"]
     ena = ena_filereport(biosamples, fields=ena_fields, chunk_size=25, timeout=120)
 
     ena_bs_map = pd.DataFrame(columns=["biosample_accession", "rnaseq_run_ids_ena", "ena_fastq_ftp", "ena_fastq_md5"])
@@ -428,7 +433,8 @@ def run_map_biosample_only_sra_ena(
         ena_bs_map = (
             ena.groupby("biosample_accession")
             .agg(
-                rnaseq_run_ids_ena=("run_accession", lambda s: ";".join(sorted(set([x for x in s if RUN_RE.search(str(x))]))[:500])),
+                rnaseq_run_ids_ena=("run_accession",
+                                   lambda s: ";".join(sorted(set([x for x in s if RUN_RE.search(str(x))]))[:500])),
                 ena_fastq_ftp=("fastq_ftp", lambda s: ";".join(sorted(set([x for x in s if x]))[:50])),
                 ena_fastq_md5=("fastq_md5", lambda s: ";".join(sorted(set([x for x in s if x]))[:50])),
             )
@@ -462,7 +468,7 @@ LAB_POS = re.compile(
     r"\bmic\b|minimum\s*inhibitory\s*concentration|e-?\s*test|etest|"
     r"\bvitek\b|\bphoenix\b|sensititre|"
     r"\bclsi\b|\beucast\b|"
-    r"\bast\b|antimicrobial\s*susceptibility\s*test|phenotypic|phenotype|"
+    r"\bast\b|antimicrobial\susceptibility\s*test|phenotypic|phenotype|"
     r"zone\s*diameter|inhibition\s*zone",
     re.IGNORECASE
 )
@@ -510,6 +516,14 @@ def make_species_cache_dir(cache_root: str, species: str) -> str:
     os.makedirs(d, exist_ok=True)
     os.makedirs(os.path.join(d, "amr_by_taxon"), exist_ok=True)
     return d
+
+
+def _force_text_ids(df: pd.DataFrame, cols: List[str]) -> None:
+    for c in cols:
+        if c in df.columns:
+            df[c] = df[c].fillna("").astype(str).str.strip()
+        else:
+            df[c] = ""
 
 
 def run_one_species(species_input: str, cache_root: str, out_root: str) -> Tuple[str, str, str]:
@@ -593,13 +607,8 @@ def run_one_species(species_input: str, cache_root: str, out_root: str) -> Tuple
         if genomes.empty:
             raise ValueError(f"No genomes returned for species='{species}'. (Genus-only like 'Enterobacter' may return 0.)")
 
-        # Ensure/clean string columns
-        str_cols = required_fields + accession_fields
-        for c in str_cols:
-            if c in genomes.columns:
-                genomes[c] = genomes[c].fillna("").astype(str).str.strip()
-            else:
-                genomes[c] = ""
+        # Clean string columns
+        _force_text_ids(genomes, required_fields + accession_fields)
 
         genomes["taxon_id"] = pd.to_numeric(genomes["taxon_id"], errors="coerce")
 
@@ -617,11 +626,16 @@ def run_one_species(species_input: str, cache_root: str, out_root: str) -> Tuple
         genomes.to_parquet(genomes_file, index=False)
         stat("Saved genomes to cache", True, rows=len(genomes), expected=exp_g)
 
+    # Always force key IDs to text after cache load (prevents pandas dtype surprises downstream)
+    _force_text_ids(genomes, ["genome_id", "biosample_accession", "bioproject_accession",
+                              "assembly_accession", "genbank_accessions", "refseq_accessions", "sra_accession",
+                              "genbank_assembly_accession", "refseq_assembly_accession", "assembly_accession_best"])
+
     stat(
         "Genomes stats", True,
         total=len(genomes),
         biosample_nonempty=int((genomes["biosample_accession"].astype(str).str.len() > 0).sum()),
-        taxon_ids=int(genomes["taxon_id"].dropna().nunique())
+        taxon_ids=int(pd.to_numeric(genomes["taxon_id"], errors="coerce").dropna().nunique())
     )
 
     # 2) Genome filters
@@ -650,7 +664,7 @@ def run_one_species(species_input: str, cache_root: str, out_root: str) -> Tuple
 
     stat("Genomes after filters", True, before=before, after=len(genomes), removed=before - len(genomes))
 
-    taxon_ids = sorted([int(x) for x in genomes["taxon_id"].dropna().unique().tolist()])
+    taxon_ids = sorted([int(x) for x in pd.to_numeric(genomes["taxon_id"], errors="coerce").dropna().unique().tolist()])
     stat("Taxon IDs to process", True, n=len(taxon_ids), sample=taxon_ids[:10])
 
     # 3) AMR stage (lab-only)
@@ -671,7 +685,9 @@ def run_one_species(species_input: str, cache_root: str, out_root: str) -> Tuple
     total_lab_rows_kept = 0
 
     for idx, tid in enumerate(taxon_ids, start=1):
-        do_print_taxon = (idx == 1) or (idx == total_taxa) or (PRINT_EVERY_N_TAXON_IDS and idx % PRINT_EVERY_N_TAXON_IDS == 0)
+        do_print_taxon = (
+            idx == 1 or idx == total_taxa or (PRINT_EVERY_N_TAXON_IDS and idx % PRINT_EVERY_N_TAXON_IDS == 0)
+        )
 
         pq, meta = amr_taxon_cache_paths(tid)
 
@@ -680,6 +696,7 @@ def run_one_species(species_input: str, cache_root: str, out_root: str) -> Tuple
                 m = json.load(f)
             if m.get("complete") is True:
                 df = pd.read_parquet(pq)
+                _force_text_ids(df, ["genome_id"])
                 amr_sum_parts.append(df)
 
                 kept_lab = int(m.get("lab_only_kept", 0))
@@ -715,10 +732,7 @@ def run_one_species(species_input: str, cache_root: str, out_root: str) -> Tuple
         )
 
         fetched = len(amr)
-
-        for c in AMR_FIELDS:
-            if c in amr.columns:
-                amr[c] = amr[c].fillna("").astype(str).str.strip()
+        _force_text_ids(amr, AMR_FIELDS)
 
         if len(amr) > 0:
             m_lab = lab_only_mask(amr)
@@ -780,8 +794,9 @@ def run_one_species(species_input: str, cache_root: str, out_root: str) -> Tuple
     pd.DataFrame(taxon_summary_rows).to_csv(taxon_summary_csv_cache, index=False)
 
     amr_sum = pd.concat(amr_sum_parts, ignore_index=True) if amr_sum_parts else pd.DataFrame(columns=["genome_id"])
-    dup = int(amr_sum["genome_id"].duplicated().sum()) if not amr_sum.empty else 0
+    _force_text_ids(amr_sum, ["genome_id"])
 
+    dup = int(amr_sum["genome_id"].duplicated().sum()) if not amr_sum.empty else 0
     stat("AMR stage summary", True,
          taxon_ids=total_taxa,
          taxa_with_any_lab=taxa_with_any_lab,
@@ -819,6 +834,9 @@ def run_one_species(species_input: str, cache_root: str, out_root: str) -> Tuple
         )
         stat("Saved STRONG SRA+ENA BioSample map", True, rows=len(bs_map))
 
+    _force_text_ids(bs_map, ["biosample_accession", "rnaseq_run_ids", "rnaseq_run_ids_sra",
+                             "rnaseq_run_ids_ena", "ena_fastq_ftp", "ena_fastq_md5"])
+
     # 5) Join + export
     out = genomes.merge(bs_map, on="biosample_accession", how="left")
 
@@ -846,11 +864,18 @@ def run_one_species(species_input: str, cache_root: str, out_root: str) -> Tuple
         "antibiotics_resistant", "antibiotics_susceptible", "antibiotics_intermediate"
     ]
 
+    # Safety: if cache came from older versions, add missing columns
     for c in final_cols:
         if c not in final.columns:
             final[c] = ""
 
     final_table = final[final_cols].copy()
+
+    # Critical: keep IDs as text in the CSV (prevents Excel/pandas from retyping them as floats)
+    _force_text_ids(final_table, ["genome_id", "biosample_accession", "bioproject_accession",
+                                  "assembly_accession_best", "assembly_accession",
+                                  "genbank_assembly_accession", "refseq_assembly_accession"])
+
     stat("Final table ready", True, rows=len(final_table), rnaseq_true=int(final_table["rnaseq_available"].sum()))
 
     os.makedirs(out_root, exist_ok=True)
@@ -885,26 +910,18 @@ def zip_outputs(out_root: str, paths: List[str], zip_path: str) -> None:
                 z.write(f, arcname=os.path.relpath(f, out_root))
 
 
-def cleanup_files(paths: List[str]) -> None:
-    seen = set()
-    for p in paths:
-        if not p or p in seen:
-            continue
-        seen.add(p)
-        try:
-            if os.path.exists(p):
-                os.remove(p)
-        except Exception as e:
-            print(f"[WARN] Could not delete {p}: {e}")
+def _read_csv_as_text(path: str) -> pd.DataFrame:
+    # Prevent pandas from silently converting IDs into floats and eating precision / trailing zeros.
+    return pd.read_csv(path, dtype=str, keep_default_na=False, na_filter=False)
 
 
-def build_combined_rnaseq_true_csv(species_csvs: List[tuple], out_root: str) -> str:
+def build_combined_rnaseq_true_csv(species_csvs: List[Tuple[str, str]], out_root: str) -> str:
     # Always create combined CSV for multi-species runs, even if 0 rnaseq_true rows.
     keep_frames = []
     template_cols = None
 
     for sp, path in species_csvs:
-        df = pd.read_csv(path)
+        df = _read_csv_as_text(path)
         if template_cols is None:
             template_cols = ["species"] + df.columns.tolist()
 
@@ -928,6 +945,15 @@ def build_combined_rnaseq_true_csv(species_csvs: List[tuple], out_root: str) -> 
     return combined_true_csv
 
 
+def _safe_delete(paths: List[str]) -> None:
+    for p in paths:
+        try:
+            if p and os.path.exists(p):
+                os.remove(p)
+        except Exception:
+            pass
+
+
 def main() -> None:
     ap = argparse.ArgumentParser(description="Conservative RNA-seq + AMR checker (local)")
     ap.add_argument("--species", type=str, default="", help="Comma-separated species list")
@@ -944,7 +970,7 @@ def main() -> None:
     os.makedirs(args.out_root, exist_ok=True)
 
     all_outputs: List[str] = []
-    species_csvs: List[tuple] = []
+    species_csvs: List[Tuple[str, str]] = []
 
     for s in species_list:
         print("\n" + "=" * 90)
@@ -963,26 +989,32 @@ def main() -> None:
     # Multi-species behaviour only if 2+ species succeeded
     if len(species_csvs) > 1:
         print("\n" + "=" * 90)
-        print("MULTI-SPECIES RUN → ZIP ONLY (no loose CSVs kept)")
+        print("BUILDING COMBINED rnaseq_available==True CSV")
         print("=" * 90)
 
         combined_true_csv = build_combined_rnaseq_true_csv(species_csvs, args.out_root)
         all_outputs.append(combined_true_csv)
-        
+
         ts = time.strftime("%Y%m%d_%H%M%S")
         zip_path = os.path.join(args.out_root, f"rnaseq_amr_outputs_{ts}.zip")
 
         zip_outputs(args.out_root, all_outputs, zip_path)
         print("Zipped outputs:", zip_path)
 
-        # Cleanup after zipping: remove per-species outputs + combined csv
-        cleanup_files(all_outputs)
-        print("Cleaned up temporary outputs. Only ZIP remains for this run.")
+        # Multi-species runs: keep ONLY the zip file (delete the individual CSVs we just zipped).
+        for f in all_outputs:
+            try:
+                if os.path.exists(f):
+                    os.remove(f)
+            except Exception:
+                pass
 
-    elif len(species_csvs) == 1:
-        print("\nSingle species run → CSV outputs only (no zip, no combined file).")
+
+        # UPDATED RULE: zip-only for multi-species → delete individual files from outputs folder
+        _safe_delete(all_outputs)
+        print("Cleaned up individual CSVs (multi-species run) → outputs folder now has the ZIP only.")
     else:
-        print("\nNo species succeeded → no outputs created.")
+        print("\nSingle species run → CSV outputs only (no zip, no combined file).")
 
     print("\nDONE.")
     print("Outputs folder:", os.path.abspath(args.out_root))
